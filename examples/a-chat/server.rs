@@ -14,9 +14,6 @@ use async_std::{
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-#[derive(Debug)]
-enum Void {}
-
 pub(crate) fn main() -> Result<()> {
     task::block_on(accept_loop("127.0.0.1:8080"))
 }
@@ -46,12 +43,12 @@ async fn connection_loop(broker: Sender<Event>, stream: TcpStream) -> Result<()>
         None => return Err("peer disconnected immediately".into()),
         Some(line) => line?,
     };
-    let (_shutdown_sender, shutdown_receiver) = channel::<Void>(0);
+    let stop_source = StopSource::new();
     broker
         .send(Event::NewPeer {
             name: name.clone(),
             stream: Arc::clone(&stream),
-            shutdown: shutdown_receiver,
+            stop_token: stop_source.stop_token(),
         })
         .await;
 
@@ -79,32 +76,15 @@ async fn connection_loop(broker: Sender<Event>, stream: TcpStream) -> Result<()>
     Ok(())
 }
 
-#[derive(Debug)]
-enum ConnectionWriterEvent {
-    Message(String),
-    Shutdown
-}
-
 async fn connection_writer_loop(
     messages: &mut Receiver<String>,
     stream: Arc<TcpStream>,
-    shutdown: Receiver<Void>,
+    stop_token: StopToken,
 ) -> Result<()> {
     let mut stream = &*stream;
-    let messages = messages.map(ConnectionWriterEvent::Message);
-    let shutdown = shutdown.map(|_| ConnectionWriterEvent::Shutdown).chain(stream::once(ConnectionWriterEvent::Shutdown));
-
-    let mut events = shutdown.merge(messages);
-
-    while let Some(event) = events.next().await {
-        match event {
-            ConnectionWriterEvent::Message(msg) => {
-                stream.write_all(msg.as_bytes()).await?;
-            }
-            ConnectionWriterEvent::Shutdown => {
-                break
-            }
-        }
+    let mut messages = stop_token.with(messages);
+    while let Some(msg) = messages.next().await {
+        stream.write_all(msg.as_bytes()).await?;
     }
     Ok(())
 }
@@ -114,7 +94,7 @@ enum Event {
     NewPeer {
         name: String,
         stream: Arc<TcpStream>,
-        shutdown: Receiver<Void>,
+        stop_token: StopToken,
     },
     Message {
         from: String,
@@ -152,7 +132,7 @@ async fn broker_loop(events: Receiver<Event>) {
             BrokerEvent::ClientEvent(Event::NewPeer {
                 name,
                 stream,
-                shutdown,
+                stop_token,
             }) => match peers.entry(name.clone()) {
                 Entry::Occupied(..) => (),
                 Entry::Vacant(entry) => {
@@ -161,7 +141,7 @@ async fn broker_loop(events: Receiver<Event>) {
                     let  disconnect_sender = disconnect_sender.clone();
                     spawn_and_log_error(async move {
                         let res =
-                            connection_writer_loop(&mut client_receiver, stream, shutdown).await;
+                            connection_writer_loop(&mut client_receiver, stream, stop_token).await;
                         disconnect_sender
                             .send((name, client_receiver))
                             .await;
@@ -189,4 +169,81 @@ where
             eprintln!("{}", e)
         }
     })
+}
+
+// This really should the be library code ...
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use pin_project_lite::pin_project;
+
+struct StopSource {
+    // This should be `!` and not `()`, but this channel is encapsulated so this doesn't matter a ton
+    _chan: Sender<()>,
+    stop_token: StopToken,
+}
+
+#[derive(Debug, Clone)]
+struct StopToken {
+    chan: Receiver<()>,
+}
+
+impl StopSource {
+    fn new() -> StopSource {
+        let (sender, receiver) = channel::<()>(0);
+
+        StopSource {
+            _chan: sender,
+            stop_token: StopToken { chan: receiver },
+        }
+    }
+
+    fn stop_token(&self) -> StopToken {
+        self.stop_token.clone()
+    }
+}
+
+impl Future for StopToken {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let chan = Pin::new(&mut self.chan);
+        match Stream::poll_next(chan, cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(_) => Poll::Ready(())
+        }
+    }
+}
+
+impl StopToken {
+    fn with<S: Stream>(&self, stream: S) -> WithStopToken<S> {
+        WithStopToken {
+            stop_token: self.clone(),
+            stream,
+        }
+    }
+}
+
+
+pin_project! {
+    #[derive(Debug)]
+    pub struct WithStopToken<S> {
+        #[pin]
+        stop_token: StopToken,
+        #[pin]
+        stream: S,
+    }
+}
+
+
+impl<S: Stream> Stream for WithStopToken<S> {
+    type Item = S::Item;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.project();
+        if let Poll::Ready(()) = this.stop_token.poll(cx) {
+            return Poll::Ready(None);
+        }
+        this.stream.poll_next(cx)
+    }
 }
